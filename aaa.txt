@@ -1,0 +1,75 @@
+
+Projekt składa się z 4 podmodułów:
+
+\begin{itemize}
+\item Receiver
+\item Desc_hdr_bram
+\item Payload_fifo
+\item Transmitter
+\end{itemize}
+
+1) Receiver
+
+Podmoduł odczytu danych. Odczytuje dane z S_axis_data i zapisuje je w odpowiedniej strukturze pamięcie. Zapisuje kolejno: deskryptor w pamięci BRAM, nagłówek pakietu w tej samej pamięci BRAM oraz payload pakietu w kolejce fifo. Przesyła także metadane odebranego pakietu do podmodułu Controller. Zawiera automat stanów:
+
+\begin{itemize}
+\item S_IDLE - oczekiwanie na nowy pakiet i zapis dekryptora. Po wykryciu S_axis_tvalid zapisuje dekryptor w pamięci Bram i przechodzi do stanu S_HDR.
+
+\item S_HDR - zapis nagłówka. Zapisuje nagłówek pakietu pod kolejnymi adresami po deskryptorze. Minimalna długość nagłówka to 20B, dlatego automat będzie przebywał w tym stanie więcej niż jeden takt zegara. Zostaje odebrana część payload'u, którą przechowuje się w rejestrze przesuwnym, którego zawartość będzie składana w słowo 128-bitowe w koljnym stanie automatu. Następny stan to S_Payload. Zostaje ustawiona odpowiednia flaga wskazująca rodzaj transmisji: FRWD/FRAG/ICMP.
+
+\item S_payload - zapisywanie payload'u do kolejki fifo. Odebrane dane, są składane w 128-bitowe słowo, następnie są zapisywane w Payload_fifo. Po zebraniu całego pakietu (S_axis_tlast) automat przechodzi do stanu S_IDLE.
+\end{itemize}
+
+Uwaga: W stanie S_HDR należy uwzględnić zmienną długość nagłówka (IHL). Minimalna długość to 20 B, ale może być większa (opcje IP). Rejestr przesuwny musi być odpowiednio szeroki.
+
+2) Desc_Hdr_RAM
+
+Pamieć True Dual-port RAM deskryptora i nagłówka pakietu. Port A podłączony do podmodułu Receiver, a port B podłączony do podmodułu Hdr_modifier. Nagłówek IP może mieć do 60 B (15 słów 32-bitowych). Przy szerokości 128 b (16 B) potrzeba maksymalnie 4 słów 128-bitowych na nagłówek. Należy więc zarezerwować 4 adresy na nagłówek.
+
+3) Payload_fifo
+
+Przechowuje dane pakietu. Fifo o szerokości 128 bitów. Zapis i odczyt przez interfejs AXI4-Stream. Uwagi:
+
+\begin{itemize}
+\item Należy zadbać o sygnał TLAST – FIFO musi informować Transmitter o końcu pakietu.
+\item Głębokość FIFO powinna być wystarczająca, aby pomieścić cały payload przy 200 MHz. Dla MTU 1500 B i 128 b (16 B) na takt, potrzeba około 94 taktów – FIFO o głębokości 128 słów powinno wystarczyć.
+
+4) Transmitter
+
+Wysyła dane po porcie M_axis lub M_axis_osq. Czyta metadane pakietu, oblicza sumy kontrolne nagłówków i steruje pobieraniem danych z pamięci BRAM i kolejki FIFO. W celu zrównoleglenia operacji wydzielono równolegle działające bloki: Hdr_prefetch, Checksum_pipeline, Frag_scheduler oraz Output_mux. Deskryptor i nagłówek są przechowywane w tej samej pamięci BRAM, dlatego Hdr_prefetch odczytuje nagłówek spod adresu deskryptora + 1. Zawiera automat stanów:
+
+\item S_IDLE - oczekiwanie na nowy pakiet. Po odebraniu sygnału meta_valid od Receivera następuje zapisanie metadanych (tryb, IHL, total_length, MTU, adresy BRAM, długość payloadu). Równolegle Hdr_prefetch przygotowuje się do odczytu deskryptora i nagłówka z tej samej pamięci BRAM. W zależności od pola mode: FRWD -> przejście do S_FRWD_DESC, FRAG -> przejście do S_FRAG_INIT, ICMP -> przejście do S_ICMP_DESC.
+
+\item S_FRWD_DESC - odczyt deskryptora z Desc_Hdr_RAM pod adresem przekazanym w metadanych i wysłanie go (128 b) na M_axis. Równolegle Hdr_prefetch odczytuje oryginalny nagłówek IP z tej samej pamięci BRAM (adres = adres deskryptora + 1) i przygotowuje go do wysłania. Po potwierdzeniu tready przejście do S_FRWD_HDR.
+
+\item S_FRWD_HDR - wysłanie oryginalnego nagłówka IP na M_axis. Nagłówek może być krótszy niż 128 b – należy uzupełnić brakujące bajty i ustawić odpowiednie tkeep. Dzięki Hdr_prefetch nagłówek jest już gotowy, więc stan trwa minimalną liczbę taktów. Checksum_pipe jest bezczynny. Po zakończeniu -> S_FRWD_PAYLOAD.
+
+\item S_FRWD_PAYLOAD - odczyt danych z Payload_FIFO i strumieniowanie ich na M_axis aż do odebrania tlast z FIFO. Równolegle Checksum_pipe i Frag_scheduler są bezczynne. Po zakończeniu transmisji generowany jest impuls Stat_frwd i następuje powrót do S_IDLE.
+
+\item S_FRAG_INIT - Frag_scheduler oblicza długość pierwszego fragmentu. Ustawienie offset = 0, MF = 1. Równolegle Hdr_prefetch pobiera oryginalny nagłówek IP z tej samej pamięci BRAM, a Checksum_pipeline przygotowuje się do obliczeń. Przejście do S_FRAG_DESC.
+
+\item S_FRAG_DESC - wysłanie deskryptora (tego samego dla każdego fragmentu) na M_axis. Równolegle Hdr_prefetch modyfikuje pola nagłówka IP dla bieżącego fragmentu (total_length, MF, fragment_offset), a Checksum_pipe oblicza nową sumę kontrolną nagłówka IP. Następny stan to S_FRAG_HDR.
+
+\item S_FRAG_HDR - wysłanie zmodyfikowanego nagłówka IP na M_axis. Dzięki Checksum_pipe suma kontrolna jest już obliczona, a Hdr_prefetch przygotowuje nagłówek dla następnego fragmentu. Po zakończeniu przejście do S_FRAG_PAYLOAD.
+
+\item S_FRAG_PAYLOAD - wysłanie dokładnie frag_payload_len bajtów z Payload_FIFO na M_axis. Równolegle Frag_scheduler oblicza długość kolejnego fragmentu, offset oraz MF, a Checksum_pipe oblicza sumę kontrolną dla następnego nagłówka. Po wysłaniu całego fragmentu przejście do S_FRAG_COMMIT.
+
+\item S_FRAG_COMMIT - sprawdzenie, czy pozostały jeszcze dane do wysłania:
+  \begin{itemize}
+  \item Jeśli remaining_bytes > 0: aktualizacja offset += frag_payload_len >> 3; obliczenie długości kolejnego fragmentu (ostatni może być krótszy); ustawienie odpowiedniej wartości MF; powrót do S_FRAG_DESC. Dzięki zrównolegleniu deskryptor i nagłówek następnego fragmentu są już przygotowane.
+  \item Jeśli remaining_bytes == 0: impuls stat_frag i powrót do S_IDLE.
+  \end{itemize}
+
+\item S_ICMP_DESC - wysłanie deskryptora na M_axis_osq. Równolegle Checksum_pipe oblicza sumę kontrolną IP dla nowego nagłówka, a Hdr_prefetch pobiera oryginalny nagłówek IP z tej samej pamięci BRAM. Po tready przejście do S_ICMP_HDR.
+
+\item S_ICMP_HDR - budowa nowego nagłówka IP dla komunikatu ICMP:
+  źródło = adres routera (lub inny skonfigurowany),
+  cel = źródłowy adres IP z oryginalnego pakietu,
+  protokół = ICMP,
+  total_length = 20 + 8 + 20 + 8 = 56 bajtów (nowy nagłówek IP + nagłówek ICMP + oryginalny nagłówek IP + 8 B payloadu).
+  Suma kontrolna IP jest obliczana równolegle w Checksum_pipeline. Następnie budowa nagłówka ICMP type 3 code 4 (8 B) z sumą kontrolną ICMP obliczoną po złożeniu całego komunikatu (nagłówek ICMP + oryginalny nagłówek IP + pierwsze 8 B payloadu). Wysłanie nowego nagłówka IP oraz nagłówka ICMP na M_axis_osq. Następny stan to S_ICMP_PAYLOAD.
+
+\item S_ICMP_PAYLOAD - odczyt oryginalnego nagłówka IP z Desc_Hdr_RAM (20 B) oraz pierwszych 8 B payloadu z Payload_FIFO. Wysłanie tych danych na M_axis_osq. Równolegle Checksum_pipe finalizuje sumę kontrolną ICMP. Po zakończeniu przejście do S_ICMP_FLUSH.
+
+\item S_ICMP_FLUSH - odrzucenie pozostałej części payloadu z Payload_FIFO. Generowany jest impuls Stat_osq. Powrót do S_IDLE.
+\end{itemize}
